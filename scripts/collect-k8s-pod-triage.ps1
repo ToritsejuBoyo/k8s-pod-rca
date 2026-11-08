@@ -111,3 +111,4 @@ $jsonOutput = $snapshot | ConvertTo-Json -Depth 20
 [System.IO.File]::WriteAllText($OutputPath, $jsonOutput, [System.Text.Encoding]::UTF8)
 
 Write-Host "[+] Successfully saved read-only diagnostic snapshot to: $OutputPath"
+

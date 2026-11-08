@@ -34,3 +34,4 @@ Events:
 --- LOGS: inventory-sync ---
 /bin/sh: /app/entrypoint.sh: Permission denied
 Can't open /app/entrypoint.sh: Permission denied
+

@@ -188,11 +188,14 @@ python tests/extreme_test_k8s_pod_rca.py
 
 # 4. Advanced Runtime & Architecture Edge Cases (20 tests)
 python tests/advanced_edge_cases_test.py
+
+# 5. Extreme Boundary Conditions Round 2 (20 tests)
+python tests/extreme_edge_cases_round2_test.py
 ```
 
 ### Test Coverage Highlights
-- **72 total automated tests** returning exit code 0 across all test suites.
-- **High-throughput processing:** Ingests 50,000 log lines in ~0.06 seconds (>800,000 lines/second).
+- **92 total automated tests** returning exit code 0 across all test suites.
+- **High-throughput processing:** Ingests 50,000 log lines in ~0.046 seconds (>1,000,000 lines/second).
 - **ReDoS resilience:** Bounded RFC regex engines prevent polynomial backtracking on adversarial input strings.
 - **100% Synthetic Identifiers:** All fixtures utilize obvious mock identifiers (`mock-pod-01`, `synthetic-test.local`, `192.0.2.1`).
 
@@ -254,3 +257,4 @@ python scripts/k8s_pod_rca.py --help
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 Copyright (c) 2026 Toritseju Boyo.
+

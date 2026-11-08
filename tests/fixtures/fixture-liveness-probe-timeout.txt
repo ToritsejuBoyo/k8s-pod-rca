@@ -45,3 +45,4 @@ Events:
 2026-11-04 11:25:25.100  INFO 1 --- [main] o.f.core.internal.command.DbMigrate      : Executing Flyway schema migration scripts across 14 tables...
 2026-11-04 11:25:44.200  WARN 1 --- [http-nio-8080-exec-1] c.s.b.w.HealthEndpoint : Healthz check received before schema migrations completed. Response took 1.25s.
 2026-11-04 11:25:45.000  INFO 1 --- [Thread-5] c.s.b.BillingApplication : Received SIGTERM from kubelet. Initiating graceful shutdown.
+
