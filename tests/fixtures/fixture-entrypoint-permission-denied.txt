@@ -1,0 +1,36 @@
+Name:             synthetic-inventory-sync-94b2a-q7w1
+Namespace:        synthetic-workloads
+Node:             node-03.internal/192.0.2.12
+Status:           Running
+Containers:
+  inventory-sync:
+    Container ID:   containerd://0000000000000000000000000000000000000000000000000000000000000003
+    Image:          registry.example.local/synthetic-workloads/inventory-sync:v1.1.0
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       ContainerCannotRun
+      Exit Code:    126
+      Started:      Wed, 04 Nov 2026 13:00:00 +0000
+      Finished:     Wed, 04 Nov 2026 13:00:01 +0000
+    Ready:          False
+    Restart Count:  6
+    Command:
+      /app/entrypoint.sh
+    Security Context:
+      Run As Non Root:  true
+      Run As User:      10001
+      Read Only Rootfs: true
+
+Events:
+  Type     Reason     Age                From               Message
+  ----     ------     ----               ----               -------
+  Normal   Scheduled  10m                default-scheduler  Successfully assigned synthetic-workloads/synthetic-inventory-sync-94b2a-q7w1 to node-03.internal
+  Normal   Pulled     9m                 kubelet            Container image already present on machine
+  Normal   Created    9m                 kubelet            Created container inventory-sync
+  Warning  Failed     9m (x6 over 10m)   kubelet            Error: failed to create containerd task: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: exec: "/app/entrypoint.sh": permission denied: unknown
+  Warning  BackOff    8m (x15 over 9m)   kubelet            Back-off restarting failed container inventory-sync
+
+--- LOGS: inventory-sync ---
+/bin/sh: /app/entrypoint.sh: Permission denied
+Can't open /app/entrypoint.sh: Permission denied

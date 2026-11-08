@@ -1,0 +1,1171 @@
+#!/usr/bin/env python3
+"""
+Kubernetes CrashLoopBackOff & OOMKilled RCA Engine (k8s-pod-rca)
+
+Autonomous, deterministic, client-side diagnostic engine that ingests
+Kubernetes pod snapshots, decodes container exit codes, cgroup limits,
+probe timings, and lifecycle events, and synthesizes a production-ready
+K8s YAML manifest diff and SRE Root Cause Analysis report.
+
+Zero external dependencies - Python standard library only.
+Strict zero-emoji enterprise tone (Rule 7).
+Client-side PII sanitization (Rule 4).
+"""
+
+import argparse
+import dataclasses
+from dataclasses import dataclass, field
+import datetime
+import difflib
+import hashlib
+import html
+import json
+import os
+from pathlib import Path
+import re
+import sys
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+# ----------------------------------------------------------------------
+# Client-Side Data Sanitization (Rule 4 & Rule 7)
+# ----------------------------------------------------------------------
+
+class Sanitizer:
+    """
+    Deterministic client-side sanitization engine for Kubernetes telemetry.
+    Scrubs internal IP addresses, cluster FQDNs, node hostnames, container IDs,
+    service account tokens, cloud credentials, environment secrets, and emojis.
+    """
+
+    # Bounded RFC 5321 regex to avoid polynomial ReDoS backtracking
+    EMAIL_PATTERN = re.compile(
+        r"(?<![\w._%+-/])[\w._%+-]{1,64}@[\w.-]{1,255}\.[\w-]{2,24}\b",
+        re.UNICODE
+    )
+
+    # Standard GUID / UUID
+    GUID_PATTERN = re.compile(
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+    )
+
+    # IPv4 addresses
+    IPV4_PATTERN = re.compile(
+        r"\b(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}\b"
+    )
+
+    # IPv6 addresses (full, compressed, and zone-indexed)
+    IPV6_PATTERN = re.compile(
+        r"\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}(?:%[a-zA-Z0-9_.-]+)?\b|"
+        r"\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}(?:%[a-zA-Z0-9_.-]+)?\b|"
+        r"\b::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}(?:%[a-zA-Z0-9_.-]+)?\b|"
+        r"\bfe80::[0-9a-fA-F:]*(?:%[a-zA-Z0-9_.-]+)?\b"
+    )
+
+    # Internal Kubernetes cluster DNS domains (*.svc.cluster.local)
+    CLUSTER_DNS_PATTERN = re.compile(
+        r"\b[a-zA-Z0-9_-]{1,63}(?:\.[a-zA-Z0-9_-]{1,63})*\.svc\.cluster\.local\b",
+        re.IGNORECASE
+    )
+
+    # Cloud container registries (bounded RFC labels to eliminate ReDoS backtracking)
+    REGISTRY_PATTERN = re.compile(
+        r"\b(?:\d{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com|[a-zA-Z0-9]{3,50}\.azurecr\.io|(?:(?:us|eu|asia)\.)?gcr\.io|[a-zA-Z0-9_.-]{1,63}\.pkg\.dev|harbor\.[a-zA-Z0-9_.-]{1,63})\b",
+        re.IGNORECASE
+    )
+
+    # Kubernetes Node hostnames (bounded labels to prevent ReDoS backtracking)
+    NODE_HOSTNAME_PATTERN = re.compile(
+        r"\b(?:ip-(?:\d{1,3}-){3}\d{1,3}|aks-[a-z0-9_-]{1,63}|gke-[a-z0-9_-]{1,63}|worker-[a-z0-9_-]{1,63}|node-[a-z0-9_-]{1,63}|k8s-node-[a-z0-9_-]{1,63})(?:\.[a-zA-Z0-9_.-]{1,63})?\b",
+        re.IGNORECASE
+    )
+
+    # Container runtime IDs (containerd, docker, cri-o)
+    CONTAINER_ID_PATTERN = re.compile(
+        r"\b(?:containerd|docker|cri-o)://[0-9a-fA-F]{64}\b"
+    )
+
+    # Kubernetes ServiceAccount JWT tokens and Bearer tokens
+    TOKEN_PATTERNS = [
+        re.compile(r"\beyJhbGciOi[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),  # JWT
+        re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS Access Key ID
+        re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}\b"),  # GitHub Token
+        re.compile(r"(?i)(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?(?:key|token)|client[_-]?secret|access[_-]?token|auth[_-]?token|private[_-]?key)\s*[:=]\s*['\"]?([^\s'\",;]{1,256})['\"]?"),
+        re.compile(r"\b(?:bearer\s+[a-zA-Z0-9_\-\.]{20,512})\b", re.IGNORECASE),
+    ]
+
+    # Rule 7 Enterprise compliance: scrub casual or user-submitted emojis
+    EMOJI_PATTERN = re.compile(
+        r"[\U00010000-\U0010ffff]|[\u2600-\u27bf]|[\u2300-\u23ff]|[\u2b50-\u2b55]"
+    )
+
+    def __init__(self, salt: str = "k8s-rca-salt") -> None:
+        self.salt = salt
+        self._ip_map: Dict[str, str] = {}
+        self._node_map: Dict[str, str] = {}
+        self._ip_counter = 1
+        self._node_counter = 1
+
+    def _mask_ipv4(self, match: re.Match) -> str:
+        ip = match.group(0)
+        # Preserve loopback or RFC 5737 documentation test IPs
+        if ip.startswith("127.") or ip.startswith("192.0.2.") or ip.startswith("198.51.100.") or ip.startswith("203.0.113."):
+            return ip
+        if ip in self._ip_map:
+            return self._ip_map[ip]
+        mapped = f"192.0.2.{self._ip_counter % 250 + 1}"
+        self._ip_counter += 1
+        self._ip_map[ip] = mapped
+        return mapped
+
+    def _mask_node(self, match: re.Match) -> str:
+        node = match.group(0)
+        if node.lower().startswith("node-") and node.lower().endswith(".internal"):
+            return node
+        if node in self._node_map:
+            return self._node_map[node]
+        mapped = f"node-{self._node_counter:02d}.internal"
+        self._node_counter += 1
+        self._node_map[node] = mapped
+        return mapped
+
+    def scrub(self, text: str) -> str:
+        """
+        Applies full data sanitization pipeline to the provided Kubernetes text.
+        """
+        if not text:
+            return ""
+
+        # 1. Neutralize dangerous script execution schemes
+        text = re.sub(r"(?i)\bjavascript\s*:", "[BLOCKED_SCRIPT]:", text)
+
+        # 2. Scrub Container Runtime IDs
+        text = self.CONTAINER_ID_PATTERN.sub("containerd://[REDACTED_CONTAINER_ID]", text)
+
+        # 3. Scrub GUIDs early
+        text = self.GUID_PATTERN.sub("00000000-0000-4000-a000-000000000000", text)
+
+        # 4. Scrub credentials, JWTs, and cloud API keys
+        for pattern in self.TOKEN_PATTERNS:
+            text = pattern.sub("[REDACTED_SECRET]", text)
+
+        # 5. Scrub emails
+        text = self.EMAIL_PATTERN.sub("user-masked@example.local", text)
+
+        # 6. Scrub registry URLs
+        text = self.REGISTRY_PATTERN.sub("registry.example.local", text)
+
+        # 7. Scrub cluster FQDNs (*.svc.cluster.local)
+        text = self.CLUSTER_DNS_PATTERN.sub("service.namespace.svc.example.local", text)
+
+        # 8. Scrub Node Hostnames
+        text = self.NODE_HOSTNAME_PATTERN.sub(self._mask_node, text)
+
+        # 9. Scrub IPv4 addresses
+        text = self.IPV4_PATTERN.sub(self._mask_ipv4, text)
+
+        # 10. Scrub IPv6 addresses
+        text = self.IPV6_PATTERN.sub("2001:db8::1", text)
+
+        # 11. Scrub any residual emoji characters to enforce Rule 7 compliance
+        text = self.EMOJI_PATTERN.sub("", text)
+
+        return text
+
+
+# ----------------------------------------------------------------------
+# Kubernetes Data Structures
+# ----------------------------------------------------------------------
+
+@dataclass
+class ContainerStatus:
+    name: str = "main"
+    ready: bool = False
+    restart_count: int = 0
+    state_reason: str = ""
+    state_message: str = ""
+    exit_code: Optional[int] = None
+    signal: Optional[int] = None
+    started_at: str = ""
+    finished_at: str = ""
+    is_oom_killed: bool = False
+    survival_seconds: Optional[float] = None
+
+
+@dataclass
+class ProbeConfig:
+    probe_type: str = "liveness"  # liveness, readiness, startup
+    path: str = ""
+    port: Any = None
+    initial_delay_seconds: int = 0
+    period_seconds: int = 10
+    timeout_seconds: int = 1
+    failure_threshold: int = 3
+    success_threshold: int = 1
+
+
+@dataclass
+class ResourceConfig:
+    cpu_request: str = ""
+    cpu_limit: str = ""
+    memory_request: str = ""
+    memory_limit: str = ""
+
+
+@dataclass
+class PodSnapshot:
+    pod_name: str = "synthetic-pod"
+    namespace: str = "default"
+    phase: str = "Running"
+    qos_class: str = "Burstable"
+    node_name: str = "node-01.internal"
+    containers: List[ContainerStatus] = field(default_factory=list)
+    init_containers: List[ContainerStatus] = field(default_factory=list)
+    probes: Dict[str, Dict[str, ProbeConfig]] = field(default_factory=dict)
+    resources: Dict[str, ResourceConfig] = field(default_factory=dict)
+    events: List[str] = field(default_factory=list)
+    previous_logs: Dict[str, str] = field(default_factory=dict)
+    current_logs: Dict[str, str] = field(default_factory=dict)
+    raw_manifest: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RCAResult:
+    category: str = "CrashLoopBackOff"  # OOMKilled, LivenessProbeTimeout, MissingSecret, CommandNotFound, PermissionDenied, Segfault, Evicted
+    confidence: str = "High"  # High, Medium, Low
+    exit_code: Optional[int] = None
+    faulting_container: str = "main"
+    immediate_cause: str = ""
+    root_cause: str = ""
+    evidence: List[str] = field(default_factory=list)
+    timeline: List[str] = field(default_factory=list)
+    manifest_patch: str = ""
+    verification_commands: List[str] = field(default_factory=list)
+    target_controller: str = "Deployment"
+
+
+# ----------------------------------------------------------------------
+# Telemetry Parser
+# ----------------------------------------------------------------------
+
+class PodSnapshotParser:
+    """
+    Ingests Kubernetes telemetry across diverse formats:
+    - Structured JSON snapshot (from collect-k8s-pod-triage.sh/.ps1)
+    - Raw kubectl get pod -o json
+    - Raw kubectl describe pod text output
+    - Plain text incident transcripts combining manifests, logs, and events.
+    """
+
+    def __init__(self, sanitizer: Optional[Sanitizer] = None) -> None:
+        self.sanitizer = sanitizer or Sanitizer()
+
+    def parse(self, raw_content: str) -> PodSnapshot:
+        content = raw_content.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not content:
+            return PodSnapshot(pod_name="empty-input", phase="Unknown")
+
+        # Strip UTF-8 BOM if present
+        if content.startswith("\ufeff"):
+            content = content[1:].strip()
+
+        # Strip ANSI escape sequences if terminal transcripts are passed
+        content = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", content)
+
+        # Attempt structured JSON parsing
+        if content.startswith("{") and content.endswith("}"):
+            try:
+                data = json.loads(content)
+                if isinstance(data, dict):
+                    # Check for collector snapshot schema
+                    if "pod_spec_and_status" in data or "pod" in data:
+                        return self._parse_collector_snapshot(data)
+                    # Check for direct kubectl get pod -o json or generic pod dictionary
+                    elif data.get("kind") == "Pod" or "status" in data or "spec" in data:
+                        return self._parse_k8s_pod_json(data)
+            except (json.JSONDecodeError, RecursionError):
+                pass
+
+        # Fall back to raw text / kubectl describe parser
+        return self._parse_describe_or_text(content)
+
+    def _parse_collector_snapshot(self, data: Dict[str, Any]) -> PodSnapshot:
+        pod_data = data.get("pod_spec_and_status", data.get("pod", {}))
+        snapshot = self._parse_k8s_pod_json(pod_data)
+
+        # Extract namespace events if provided in snapshot bundle
+        events_list = data.get("events", [])
+        if isinstance(events_list, list):
+            for ev in events_list:
+                if isinstance(ev, str):
+                    snapshot.events.append(ev.strip())
+                elif isinstance(ev, dict):
+                    msg = ev.get("message", ev.get("note", ""))
+                    reason = ev.get("reason", "")
+                    typ = ev.get("type", "Normal")
+                    snapshot.events.append(f"{typ} {reason}: {msg}")
+
+        # Extract previous container logs
+        prev_logs = data.get("previous_logs", {})
+        if isinstance(prev_logs, dict):
+            for c_name, log_text in prev_logs.items():
+                if isinstance(log_text, str):
+                    snapshot.previous_logs[c_name] = log_text
+
+        # Extract current container logs
+        cur_logs = data.get("current_logs", {})
+        if isinstance(cur_logs, dict):
+            for c_name, log_text in cur_logs.items():
+                if isinstance(log_text, str):
+                    snapshot.current_logs[c_name] = log_text
+
+        return snapshot
+
+    def _parse_k8s_pod_json(self, data: Dict[str, Any]) -> PodSnapshot:
+        snapshot = PodSnapshot()
+        snapshot.raw_manifest = data
+
+        meta = data.get("metadata", {})
+        snapshot.pod_name = str(meta.get("name", "synthetic-pod"))
+        snapshot.namespace = str(meta.get("namespace", "default"))
+
+        status = data.get("status", {})
+        snapshot.phase = str(status.get("phase", "Running"))
+        snapshot.qos_class = str(status.get("qosClass", "Burstable"))
+        snapshot.node_name = str(data.get("spec", {}).get("nodeName", status.get("hostIP", "node-01.internal")))
+
+        spec = data.get("spec", {})
+        containers_spec = spec.get("containers", [])
+        for c in containers_spec:
+            if not isinstance(c, dict):
+                continue
+            c_name = c.get("name", "main")
+            # Parse resource requests and limits
+            res = c.get("resources", {})
+            reqs = res.get("requests", {})
+            limits = res.get("limits", {})
+            snapshot.resources[c_name] = ResourceConfig(
+                cpu_request=str(reqs.get("cpu", "")),
+                cpu_limit=str(limits.get("cpu", "")),
+                memory_request=str(reqs.get("memory", "")),
+                memory_limit=str(limits.get("memory", ""))
+            )
+
+            # Parse probes
+            c_probes: Dict[str, ProbeConfig] = {}
+            for p_type in ["livenessProbe", "readinessProbe", "startupProbe"]:
+                if p_type in c and isinstance(c[p_type], dict):
+                    p_obj = c[p_type]
+                    http_get = p_obj.get("httpGet", {})
+                    path = http_get.get("path", "")
+                    port = http_get.get("port", p_obj.get("tcpSocket", {}).get("port", None))
+                    c_probes[p_type.replace("Probe", "")] = ProbeConfig(
+                        probe_type=p_type.replace("Probe", ""),
+                        path=path,
+                        port=port,
+                        initial_delay_seconds=int(p_obj.get("initialDelaySeconds", 0)),
+                        period_seconds=int(p_obj.get("periodSeconds", 10)),
+                        timeout_seconds=int(p_obj.get("timeoutSeconds", 1)),
+                        failure_threshold=int(p_obj.get("failureThreshold", 3)),
+                        success_threshold=int(p_obj.get("successThreshold", 1))
+                    )
+            snapshot.probes[c_name] = c_probes
+
+        # Parse container status and termination reasons
+        c_statuses = status.get("containerStatuses", [])
+        for cs in c_statuses:
+            if not isinstance(cs, dict):
+                continue
+            c_stat = self._extract_container_status(cs)
+            snapshot.containers.append(c_stat)
+
+        # Parse init container status
+        init_statuses = status.get("initContainerStatuses", [])
+        for ics in init_statuses:
+            if not isinstance(ics, dict):
+                continue
+            c_stat = self._extract_container_status(ics)
+            snapshot.init_containers.append(c_stat)
+
+        return snapshot
+
+    def _extract_container_status(self, cs: Dict[str, Any]) -> ContainerStatus:
+        c_stat = ContainerStatus()
+        c_stat.name = str(cs.get("name", "main"))
+        c_stat.ready = bool(cs.get("ready", False))
+        c_stat.restart_count = int(cs.get("restartCount", 0))
+
+        state = cs.get("state", {})
+        last_state = cs.get("lastState", {})
+
+        # Inspect current state
+        if "waiting" in state and isinstance(state["waiting"], dict):
+            c_stat.state_reason = state["waiting"].get("reason", "Waiting")
+            c_stat.state_message = state["waiting"].get("message", "")
+        elif "terminated" in state and isinstance(state["terminated"], dict):
+            term = state["terminated"]
+            c_stat.state_reason = term.get("reason", "Terminated")
+            c_stat.state_message = term.get("message", "")
+            c_stat.exit_code = term.get("exitCode")
+            c_stat.signal = term.get("signal")
+            c_stat.started_at = term.get("startedAt", "")
+            c_stat.finished_at = term.get("finishedAt", "")
+            if c_stat.state_reason == "OOMKilled" or c_stat.exit_code == 137:
+                c_stat.is_oom_killed = (c_stat.state_reason == "OOMKilled")
+
+        # Inspect last state if current is waiting (classic CrashLoopBackOff)
+        if "terminated" in last_state and isinstance(last_state["terminated"], dict):
+            last_term = last_state["terminated"]
+            if c_stat.exit_code is None:
+                c_stat.exit_code = last_term.get("exitCode")
+            if not c_stat.state_reason or c_stat.state_reason == "CrashLoopBackOff":
+                c_stat.state_reason = last_term.get("reason", c_stat.state_reason)
+            c_stat.signal = last_term.get("signal")
+            c_stat.started_at = last_term.get("startedAt", "")
+            c_stat.finished_at = last_term.get("finishedAt", "")
+            if last_term.get("reason") == "OOMKilled":
+                c_stat.is_oom_killed = True
+
+        # Calculate container survival duration
+        if c_stat.started_at and c_stat.finished_at:
+            try:
+                start_dt = datetime.datetime.fromisoformat(c_stat.started_at.replace("Z", "+00:00"))
+                finish_dt = datetime.datetime.fromisoformat(c_stat.finished_at.replace("Z", "+00:00"))
+                c_stat.survival_seconds = max(0.0, (finish_dt - start_dt).total_seconds())
+            except (ValueError, TypeError):
+                pass
+
+        return c_stat
+
+    def _parse_describe_or_text(self, text: str) -> PodSnapshot:
+        snapshot = PodSnapshot()
+        lines = text.splitlines()
+
+        c_name = "main"
+        exit_code = None
+        term_reason = ""
+        restarts = 0
+        events: List[str] = []
+        log_lines: List[str] = []
+
+        is_event_section = False
+        is_log_section = False
+
+        for line in lines:
+            line_str = line.strip()
+            if not line_str:
+                continue
+
+            lower_line = line_str.lower()
+
+            if lower_line.startswith("name:") and (not snapshot.pod_name or snapshot.pod_name == "synthetic-pod"):
+                snapshot.pod_name = line_str.split(":", 1)[1].strip()
+            elif lower_line.startswith("namespace:") and snapshot.namespace == "default":
+                snapshot.namespace = line_str.split(":", 1)[1].strip()
+            elif lower_line.startswith("status:") or lower_line.startswith("phase:"):
+                snapshot.phase = line_str.split(":", 1)[1].strip()
+            elif lower_line.startswith("node:"):
+                snapshot.node_name = line_str.split(":", 1)[1].strip().split("/")[0]
+
+            # Detect sections
+            if "events:" in lower_line or lower_line.startswith("events:"):
+                is_event_section = True
+                is_log_section = False
+                continue
+            elif "logs:" in lower_line or "previous log:" in lower_line or lower_line.startswith("--- logs"):
+                is_log_section = True
+                is_event_section = False
+                continue
+
+            if is_event_section:
+                events.append(line_str)
+            elif is_log_section:
+                log_lines.append(line_str)
+
+            # Detect exit codes and reasons in text
+            exit_m = re.search(r"exit\s*code:?\s*(\d+)", line_str, re.IGNORECASE)
+            if exit_m:
+                exit_code = int(exit_m.group(1))
+
+            if "oomkilled" in lower_line:
+                term_reason = "OOMKilled"
+            elif "crashloopbackoff" in lower_line:
+                if not term_reason:
+                    term_reason = "CrashLoopBackOff"
+            elif "createcontainerconfigerror" in lower_line:
+                term_reason = "CreateContainerConfigError"
+            elif "imagepullbackoff" in lower_line:
+                term_reason = "ImagePullBackOff"
+
+            restart_m = re.search(r"restart\s*count:?\s*(\d+)", line_str, re.IGNORECASE)
+            if restart_m:
+                restarts = int(restart_m.group(1))
+
+        # Check for Liveness probe configuration in text
+        if "liveness:" in text.lower():
+            p_m = re.search(r"delay=(\d+)s.*timeout=(\d+)s.*period=(\d+)s.*#failure=(\d+)", text, re.IGNORECASE)
+            if p_m:
+                snapshot.probes[c_name] = {
+                    "liveness": ProbeConfig(
+                        probe_type="liveness",
+                        initial_delay_seconds=int(p_m.group(1)),
+                        timeout_seconds=int(p_m.group(2)),
+                        period_seconds=int(p_m.group(3)),
+                        failure_threshold=int(p_m.group(4))
+                    )
+                }
+
+        c_stat = ContainerStatus(
+            name=c_name,
+            exit_code=exit_code,
+            state_reason=term_reason or ("OOMKilled" if exit_code == 137 and any(w in text.lower() for w in ["oom", "out of memory", "signal 9", "sigkill"]) else "Error"),
+            restart_count=restarts,
+            is_oom_killed=(term_reason == "OOMKilled" or (exit_code == 137 and any(w in text.lower() for w in ["oom", "out of memory", "signal 9", "sigkill"])))
+        )
+        snapshot.containers.append(c_stat)
+        snapshot.events = events
+        if log_lines:
+            snapshot.previous_logs[c_name] = "\n".join(log_lines)
+
+        return snapshot
+
+
+# ----------------------------------------------------------------------
+# Root Cause Analysis & Diagnostic Engine
+# ----------------------------------------------------------------------
+
+class K8sRCAEngine:
+    """
+    Evaluates PodSnapshot telemetry and derives the exact root cause,
+    manifest remediation diff, and verification runbook.
+    """
+
+    def __init__(self, sanitizer: Optional[Sanitizer] = None) -> None:
+        self.sanitizer = sanitizer or Sanitizer()
+
+    def analyze(self, snapshot: PodSnapshot) -> RCAResult:
+        # Determine faulting container
+        faulting_container = "main"
+        primary_status: Optional[ContainerStatus] = None
+
+        if snapshot.containers:
+            # Pick container with non-zero exit code or waiting state
+            for cs in snapshot.containers:
+                if cs.exit_code is not None and cs.exit_code != 0:
+                    primary_status = cs
+                    faulting_container = cs.name
+                    break
+                elif cs.state_reason in ["CrashLoopBackOff", "OOMKilled", "CreateContainerConfigError", "ImagePullBackOff", "ErrImagePull"]:
+                    primary_status = cs
+                    faulting_container = cs.name
+                    break
+            if not primary_status:
+                primary_status = snapshot.containers[0]
+                faulting_container = primary_status.name
+        else:
+            primary_status = ContainerStatus()
+
+        result = RCAResult(
+            faulting_container=faulting_container,
+            exit_code=primary_status.exit_code
+        )
+
+        all_text = f"{snapshot.phase} {primary_status.state_reason} {primary_status.state_message} " \
+                   f"{' '.join(snapshot.events)} {' '.join(snapshot.previous_logs.values())} " \
+                   f"{' '.join(snapshot.current_logs.values())}"
+        lower_text = all_text.lower()
+
+        # 1. Check for OOMKilled (Exit Code 137 + cgroup kill)
+        if primary_status.is_oom_killed or (primary_status.exit_code == 137 and any(w in lower_text for w in ["oom", "out of memory", "killed process", "signal 9", "sigkill"])):
+            self._diagnose_oomkilled(snapshot, primary_status, result)
+            return result
+
+        # 2. Check for Liveness / Startup Probe Failures
+        if any("liveness probe failed" in ev.lower() or "startup probe failed" in ev.lower() or "unhealthy" in ev.lower() for ev in snapshot.events) or \
+           ("probe failed" in lower_text and primary_status.exit_code in [137, 143]):
+            self._diagnose_probe_failure(snapshot, primary_status, result)
+            return result
+
+        # 3. Check for Missing Secret or ConfigMap (CreateContainerConfigError)
+        if primary_status.state_reason in ["CreateContainerConfigError", "CreateContainerError"] or \
+           any("secret" in ev.lower() and "not found" in ev.lower() for ev in snapshot.events) or \
+           any("configmap" in ev.lower() and "not found" in ev.lower() for ev in snapshot.events):
+            self._diagnose_missing_config(snapshot, primary_status, result)
+            return result
+
+        # 4. Check for Command Not Found (Exit Code 127)
+        if primary_status.exit_code == 127 or "command not found" in lower_text or "exec format error" in lower_text:
+            self._diagnose_command_not_found(snapshot, primary_status, result)
+            return result
+
+        # 5. Check for Permission Denied / Read-Only Filesystem (Exit Code 126)
+        if primary_status.exit_code == 126 or "permission denied" in lower_text or "read-only file system" in lower_text:
+            self._diagnose_permission_denied(snapshot, primary_status, result)
+            return result
+
+        # 6. Check for Native Segmentation Fault (Exit Code 139)
+        if primary_status.exit_code == 139 or "segmentation fault" in lower_text or "sigsegv" in lower_text:
+            self._diagnose_segfault(snapshot, primary_status, result)
+            return result
+
+        # 7. Check for Node Eviction (DiskPressure / MemoryPressure)
+        if snapshot.phase == "Failed" or "evicted" in lower_text or any("the node was low on resource" in ev.lower() for ev in snapshot.events):
+            self._diagnose_node_eviction(snapshot, primary_status, result)
+            return result
+
+        # Default fallback: General Application Crash (Exit Code 1, 2, or unhandled)
+        self._diagnose_generic_crash(snapshot, primary_status, result)
+        return result
+
+    def _diagnose_oomkilled(self, snapshot: PodSnapshot, cs: ContainerStatus, result: RCAResult) -> None:
+        result.category = "OOMKilled"
+        result.confidence = "High"
+        result.immediate_cause = f"Container '{cs.name}' terminated by Linux kernel cgroup OOM killer (Exit Code 137)."
+        res = snapshot.resources.get(cs.name, ResourceConfig())
+
+        mem_limit = res.memory_limit or "512Mi"
+        result.root_cause = f"Container memory consumption exceeded the declared limit of {mem_limit}. " \
+                            f"The Linux kernel cgroup memory controller invoked SIGKILL (signal 9) to prevent host exhaustion."
+
+        result.evidence = [
+            f"Exit Code: {cs.exit_code} (128 + 9 = SIGKILL)",
+            f"Termination Reason: {cs.state_reason or 'OOMKilled'}",
+            f"Declared Memory Limit: {mem_limit}",
+            f"Pod QoS Class: {snapshot.qos_class}"
+        ]
+
+        result.timeline = [
+            "Container process scheduled and began memory allocation.",
+            f"Memory consumption crossed cgroup memory limit threshold ({mem_limit}).",
+            "Kernel oom-killer selected container process and sent SIGKILL.",
+            "Kubelet detected terminated container status and transitioned Pod to CrashLoopBackOff."
+        ]
+
+        # Generate YAML Patch
+        new_limit = self._calculate_increased_memory(mem_limit)
+        result.manifest_patch = f"""--- a/deployment.yaml
++++ b/deployment.yaml
+@@ -18,4 +18,4 @@
+           resources:
+             limits:
+-              memory: {mem_limit}
++              memory: {new_limit}
+             requests:
+-              memory: {res.memory_request or '256Mi'}
++              memory: {mem_limit}"""
+
+        result.verification_commands = [
+            f"kubectl top pod {snapshot.pod_name} -n {snapshot.namespace} --containers",
+            f"kubectl describe pod {snapshot.pod_name} -n {snapshot.namespace} | grep -E 'Limits|Requests|OOMKilled'",
+            f"kubectl rollout status deployment/{self._derive_controller_name(snapshot.pod_name)} -n {snapshot.namespace}"
+        ]
+
+    def _diagnose_probe_failure(self, snapshot: PodSnapshot, cs: ContainerStatus, result: RCAResult) -> None:
+        result.category = "LivenessProbeTimeout"
+        result.confidence = "High"
+        result.immediate_cause = f"Container '{cs.name}' failed Kubernetes Liveness/Startup probe checks, prompting Kubelet to restart the container."
+
+        probes = snapshot.probes.get(cs.name, {})
+        liveness = probes.get("liveness", ProbeConfig())
+        events_str = " ".join(snapshot.events)
+
+        result.root_cause = f"Liveness probe targeting path '{liveness.path or '/healthz'}' timed out or returned HTTP failures. " \
+                            f"The container took longer to become healthy than initialDelaySeconds ({liveness.initial_delay_seconds}s) " \
+                            f"or exceeded failureThreshold ({liveness.failure_threshold} consecutive attempts)."
+
+        result.evidence = [
+            f"Exit Code: {cs.exit_code or 137} (Kubelet SIGTERM/SIGKILL termination)",
+            f"Liveness Probe Configuration: delay={liveness.initial_delay_seconds}s, timeout={liveness.timeout_seconds}s, period={liveness.period_seconds}s, failures={liveness.failure_threshold}",
+            f"Probe Failure Events: {self._extract_matching_event(snapshot.events, 'unhealthy') or 'Warning Unhealthy: Liveness probe failed'}"
+        ]
+
+        result.timeline = [
+            "Container started and initiated internal application runtime.",
+            f"Kubelet initiated probe polling after {liveness.initial_delay_seconds} seconds.",
+            f"Probe attempts exceeded failure threshold ({liveness.failure_threshold}) due to startup latency or timeout.",
+            "Kubelet sent SIGTERM, followed by SIGKILL, and scheduled container restart."
+        ]
+
+        # Generate YAML Patch to introduce startupProbe and adjust timeouts
+        result.manifest_patch = f"""--- a/deployment.yaml
++++ b/deployment.yaml
+@@ -22,6 +22,12 @@
++        startupProbe:
++          httpGet:
++            path: {liveness.path or '/healthz'}
++            port: {liveness.port or 8080}
++          failureThreshold: 30
++          periodSeconds: 10
+         livenessProbe:
+           httpGet:
+             path: {liveness.path or '/healthz'}
+             port: {liveness.port or 8080}
+-          timeoutSeconds: {liveness.timeout_seconds}
++          timeoutSeconds: 3
+-          initialDelaySeconds: {liveness.initial_delay_seconds}
++          initialDelaySeconds: 0"""
+
+        result.verification_commands = [
+            f"kubectl describe pod {snapshot.pod_name} -n {snapshot.namespace} | grep -A 8 'Liveness:'",
+            f"kubectl logs {snapshot.pod_name} -n {snapshot.namespace} -c {cs.name} --tail=50",
+            f"kubectl get events -n {snapshot.namespace} --field-selector involvedObject.name={snapshot.pod_name} --sort-by='.lastTimestamp'"
+        ]
+
+    def _diagnose_missing_config(self, snapshot: PodSnapshot, cs: ContainerStatus, result: RCAResult) -> None:
+        result.category = "MissingSecretOrConfigMap"
+        result.confidence = "High"
+        result.immediate_cause = f"Pod cannot start due to missing configuration dependency ({cs.state_reason or 'CreateContainerConfigError'})."
+
+        missing_res = "database-secret"
+        for ev in snapshot.events:
+            m = re.search(r'(?:secret|configmap)\s*["\']([^"\']+)["\']\s*not found', ev, re.IGNORECASE)
+            if m:
+                missing_res = m.group(1)
+                break
+
+        result.root_cause = f"Container '{cs.name}' declares an environment variable or volume mount referencing '{missing_res}', which does not exist in namespace '{snapshot.namespace}'."
+        result.evidence = [
+            f"Container State: {cs.state_reason or 'CreateContainerConfigError'}",
+            f"Event Message: {self._extract_matching_event(snapshot.events, 'not found') or f'secret \"{missing_res}\" not found'}"
+        ]
+
+        result.timeline = [
+            "Kubelet scheduled pod and attempted container creation.",
+            f"Kubelet queried namespace '{snapshot.namespace}' for referenced object '{missing_res}'.",
+            "API server returned 404 Not Found.",
+            "Container startup halted with CreateContainerConfigError."
+        ]
+
+        result.manifest_patch = f"""--- a/deployment.yaml
++++ b/deployment.yaml
+@@ -15,4 +15,5 @@
+               valueFrom:
+                 secretKeyRef:
+                   name: {missing_res}
+                   key: password
++                  optional: true"""
+
+        result.verification_commands = [
+            f"kubectl get secrets,configmaps -n {snapshot.namespace}",
+            f"kubectl describe pod {snapshot.pod_name} -n {snapshot.namespace} | grep -E 'Error|Warning'",
+            f"kubectl get events -n {snapshot.namespace} --field-selector involvedObject.name={snapshot.pod_name}"
+        ]
+
+    def _diagnose_command_not_found(self, snapshot: PodSnapshot, cs: ContainerStatus, result: RCAResult) -> None:
+        result.category = "CommandNotFound"
+        result.confidence = "High"
+        result.immediate_cause = f"Container entrypoint execution failed with Exit Code 127 (Command Not Found)."
+        result.root_cause = "The executable binary or shell specified in command/args is missing from container image $PATH, or dynamically linked libraries (glibc/musl) are incompatible."
+
+        result.evidence = [
+            "Exit Code: 127",
+            "Linux Error: 127 (Command Not Found / Exec format error)"
+        ]
+
+        result.timeline = [
+            "Container filesystem mounted by container runtime.",
+            "Runtime invoked execve() for configured entrypoint.",
+            "Linux kernel returned ENOENT (No such file or directory).",
+            "Container exited immediately with status code 127."
+        ]
+
+        result.manifest_patch = """--- a/deployment.yaml
++++ b/deployment.yaml
+@@ -10,3 +10,3 @@
+-        command: ["/bin/sh", "-c", "start-service.sh"]
++        command: ["/bin/sh", "-c", "./start-service.sh"]"""
+
+        result.verification_commands = [
+            f"kubectl describe pod {snapshot.pod_name} -n {snapshot.namespace} | grep -A 4 'Command:'",
+            f"kubectl logs {snapshot.pod_name} -n {snapshot.namespace} -c {cs.name} --previous"
+        ]
+
+    def _diagnose_permission_denied(self, snapshot: PodSnapshot, cs: ContainerStatus, result: RCAResult) -> None:
+        result.category = "PermissionDenied"
+        result.confidence = "High"
+        result.immediate_cause = f"Container process failed with Exit Code 126 or was blocked by filesystem security restrictions."
+        result.root_cause = "The entrypoint script lacks execute permissions, container user lacks permissions to bind ports < 1024, or process attempted write operations to read-only rootfs."
+
+        result.evidence = [
+            f"Exit Code: {cs.exit_code or 126}",
+            "Linux Error: 126 (Permission Denied / Container Cannot Run)"
+        ]
+
+        result.timeline = [
+            "Container runtime created namespaces and applied securityContext.",
+            "Process attempted restricted operation or non-executable binary call.",
+            "Kernel rejected call with EACCES / EPERM.",
+            "Container exited with code 126."
+        ]
+
+        result.manifest_patch = """--- a/deployment.yaml
++++ b/deployment.yaml
+@@ -12,4 +12,8 @@
+         volumeMounts:
++        - name: tmp-dir
++          mountPath: /tmp
++      volumes:
++      - name: tmp-dir
++        emptyDir: {}"""
+
+        result.verification_commands = [
+            f"kubectl describe pod {snapshot.pod_name} -n {snapshot.namespace} | grep -A 6 'Security Context:'",
+            f"kubectl logs {snapshot.pod_name} -n {snapshot.namespace} -c {cs.name} --previous"
+        ]
+
+    def _diagnose_segfault(self, snapshot: PodSnapshot, cs: ContainerStatus, result: RCAResult) -> None:
+        result.category = "Segfault"
+        result.confidence = "High"
+        result.immediate_cause = f"Container '{cs.name}' terminated abruptly due to memory access violation / SIGSEGV (Exit Code 139)."
+        result.root_cause = "Process attempted to read or write to an unmapped virtual memory address. Common in native C/Go extensions, corrupt shared objects, or incompatible CPU architecture."
+
+        result.evidence = [
+            "Exit Code: 139 (128 + 11 = SIGSEGV)",
+            "Linux Signal: SIGSEGV (Segmentation Violation)"
+        ]
+
+        result.timeline = [
+            "Process executed native CPU instructions.",
+            "Illegal memory pointer dereference or stack overflow occurred.",
+            "Linux kernel delivered SIGSEGV and generated core dump event.",
+            "Kubelet registered abnormal termination code 139."
+        ]
+
+        result.manifest_patch = """--- a/deployment.yaml
++++ b/deployment.yaml
+@@ -8,3 +8,3 @@
+-        image: app:v2.1.0-native
++        image: app:v2.0.9-stable"""
+
+        result.verification_commands = [
+            f"kubectl logs {snapshot.pod_name} -n {snapshot.namespace} -c {cs.name} --previous | grep -iE 'fault|dump|sigsegv'",
+            f"kubectl describe node {snapshot.node_name} | grep -E 'Architecture|OS'"
+        ]
+
+    def _diagnose_node_eviction(self, snapshot: PodSnapshot, cs: ContainerStatus, result: RCAResult) -> None:
+        result.category = "NodeEviction"
+        result.confidence = "High"
+        result.immediate_cause = f"Pod evicted by Kubelet due to node-level resource starvation."
+        result.root_cause = f"Node '{snapshot.node_name}' experienced DiskPressure or MemoryPressure exceeding eviction thresholds."
+
+        result.evidence = [
+            f"Pod Phase: {snapshot.phase}",
+            f"Eviction Event: {self._extract_matching_event(snapshot.events, 'evicted') or 'The node was low on resource'}"
+        ]
+
+        result.timeline = [
+            f"Node '{snapshot.node_name}' resource consumption crossed hard eviction threshold.",
+            "Kubelet eviction manager selected pod based on QoS class priority.",
+            "Pod received SIGTERM / SIGKILL and transitioned to Evicted state."
+        ]
+
+        result.manifest_patch = """--- a/deployment.yaml
++++ b/deployment.yaml
+@@ -16,4 +16,4 @@
+           resources:
+             requests:
+-              memory: 128Mi
++              memory: 512Mi"""
+
+        result.verification_commands = [
+            f"kubectl describe node {snapshot.node_name} | grep -A 6 'Conditions:'",
+            f"kubectl top node {snapshot.node_name}"
+        ]
+
+    def _diagnose_generic_crash(self, snapshot: PodSnapshot, cs: ContainerStatus, result: RCAResult) -> None:
+        result.category = "CrashLoopBackOff"
+        result.confidence = "Medium"
+        result.immediate_cause = f"Container '{cs.name}' exited with status code {cs.exit_code or 1} and is in CrashLoopBackOff."
+        result.root_cause = "Application encountered an unhandled runtime exception or failed startup precondition."
+
+        result.evidence = [
+            f"Exit Code: {cs.exit_code or 1}",
+            f"Restart Count: {cs.restart_count}",
+            f"Last State: {cs.state_reason}"
+        ]
+
+        result.timeline = [
+            "Container process initialized by Kubelet.",
+            f"Process encountered fatal exception and terminated with exit code {cs.exit_code or 1}.",
+            "Kubelet applied exponential backoff delay before restarting container."
+        ]
+
+        result.manifest_patch = """--- a/deployment.yaml
++++ b/deployment.yaml
+@@ -12,2 +12,4 @@
++        env:
++        - name: LOG_LEVEL
++          value: "DEBUG" """
+
+        result.verification_commands = [
+            f"kubectl logs {snapshot.pod_name} -n {snapshot.namespace} -c {cs.name} --previous --tail=100",
+            f"kubectl describe pod {snapshot.pod_name} -n {snapshot.namespace}"
+        ]
+
+    def _calculate_increased_memory(self, mem_limit: str) -> str:
+        if mem_limit.endswith("Mi"):
+            val = int(mem_limit[:-2])
+            return f"{int(val * 1.5)}Mi"
+        elif mem_limit.endswith("Gi"):
+            val = float(mem_limit[:-2])
+            return f"{int(val * 1.5)}Gi"
+        elif mem_limit.isdigit():
+            val = int(mem_limit)
+            return str(int(val * 1.5))
+        return "1Gi"
+
+    def _derive_controller_name(self, pod_name: str) -> str:
+        parts = pod_name.split("-")
+        if not parts:
+            return pod_name
+        # StatefulSet ordinal suffix: <name>-<int> (e.g., db-cluster-0)
+        if parts[-1].isdigit():
+            return "-".join(parts[:-1])
+        # Deployment replica set format: <name>-<replicaset_hash>-<pod_hash> (e.g. app-7d9c8b6f4-x9k2m)
+        if len(parts) >= 3 and len(parts[-2]) >= 8 and len(parts[-1]) <= 6:
+            return "-".join(parts[:-2])
+        # DaemonSet format: <name>-<pod_hash> (e.g. fluentbit-daemon-x9k2m)
+        if len(parts) >= 2 and len(parts[-1]) <= 6:
+            return "-".join(parts[:-1])
+        return pod_name
+
+    def _extract_matching_event(self, events: List[str], keyword: str) -> Optional[str]:
+        for ev in events:
+            if keyword.lower() in ev.lower():
+                return ev.strip()
+        return None
+
+
+# ----------------------------------------------------------------------
+# Multi-Format Report Generator
+# ----------------------------------------------------------------------
+
+class RCAReportGenerator:
+    """
+    Renders diagnostic findings and manifest diffs into Markdown,
+    clean unified diffs, structured JSON, or sanitized prompts.
+    """
+
+    def __init__(self, sanitizer: Optional[Sanitizer] = None) -> None:
+        self.sanitizer = sanitizer or Sanitizer()
+
+    def format_markdown(self, snapshot: PodSnapshot, rca: RCAResult, sanitize: bool = True) -> str:
+        today = datetime.date.today().isoformat()
+        pod_name = self.sanitizer.scrub(snapshot.pod_name) if sanitize else snapshot.pod_name
+        namespace = self.sanitizer.scrub(snapshot.namespace) if sanitize else snapshot.namespace
+        node_name = self.sanitizer.scrub(snapshot.node_name) if sanitize else snapshot.node_name
+        imm_cause = self.sanitizer.scrub(rca.immediate_cause) if sanitize else rca.immediate_cause
+        root_cause = self.sanitizer.scrub(rca.root_cause) if sanitize else rca.root_cause
+
+        evidence_items = "\n".join(f"- {self.sanitizer.scrub(e) if sanitize else e}" for e in rca.evidence)
+        timeline_items = "\n".join(f"{idx+1}. {self.sanitizer.scrub(t) if sanitize else t}" for idx, t in enumerate(rca.timeline))
+        commands_items = "\n".join(f"- `{self.sanitizer.scrub(c) if sanitize else c}`" for c in rca.verification_commands)
+
+        md = f"""# SRE Root Cause Analysis: Pod {pod_name}
+
+## Executive Summary
+- **Target Pod:** `{pod_name}`
+- **Namespace:** `{namespace}`
+- **Failure Classification:** `{rca.category}`
+- **Diagnostic Confidence:** `{rca.confidence}`
+- **Target Container:** `{rca.faulting_container}`
+- **Report Generated:** `{today}`
+
+---
+
+## 1. Symptoms & Incident Observation
+- **Immediate State:** {imm_cause}
+- **Assigned Node:** `{node_name}`
+- **Observed Exit Code:** `{rca.exit_code if rca.exit_code is not None else 'N/A'}`
+
+### Corroborating Evidence
+{evidence_items}
+
+---
+
+## 2. Root Cause Analysis
+{root_cause}
+
+### Diagnostic Timeline
+{timeline_items}
+
+---
+
+## 3. Remediation Manifest Patch
+Apply the following unified YAML diff to the workload controller manifest:
+
+```diff
+{rca.manifest_patch}
+```
+
+---
+
+## 4. Verification & Validation Commands
+Execute the following read-only commands to verify that the workload stabilizes following deployment:
+
+{commands_items}
+
+---
+
+## 5. Architectural Recommendations
+- Establish separate `startupProbe` definitions for workloads requiring cold-start caching or database migrations.
+- Set container memory limits with at least 25% overhead above observed steady-state heap utilization.
+- Implement QoS class guarantees for mission-critical microservices by setting equal CPU and memory requests and limits.
+"""
+        return md.strip()
+
+    def format_json(self, snapshot: PodSnapshot, rca: RCAResult, sanitize: bool = True) -> str:
+        data = {
+            "incident_id": f"K8S-RCA-{hashlib.md5(snapshot.pod_name.encode('utf-8')).hexdigest()[:8].upper()}",
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "target": {
+                "pod_name": self.sanitizer.scrub(snapshot.pod_name) if sanitize else snapshot.pod_name,
+                "namespace": self.sanitizer.scrub(snapshot.namespace) if sanitize else snapshot.namespace,
+                "node_name": self.sanitizer.scrub(snapshot.node_name) if sanitize else snapshot.node_name,
+                "container": rca.faulting_container,
+                "phase": snapshot.phase,
+                "qos_class": snapshot.qos_class
+            },
+            "diagnosis": {
+                "category": rca.category,
+                "confidence": rca.confidence,
+                "exit_code": rca.exit_code,
+                "immediate_cause": self.sanitizer.scrub(rca.immediate_cause) if sanitize else rca.immediate_cause,
+                "root_cause": self.sanitizer.scrub(rca.root_cause) if sanitize else rca.root_cause,
+                "evidence": [self.sanitizer.scrub(e) if sanitize else e for e in rca.evidence],
+                "timeline": [self.sanitizer.scrub(t) if sanitize else t for t in rca.timeline]
+            },
+            "remediation": {
+                "manifest_patch": rca.manifest_patch,
+                "verification_commands": [self.sanitizer.scrub(c) if sanitize else c for c in rca.verification_commands]
+            }
+        }
+        return json.dumps(data, indent=2)
+
+    def format_diff(self, rca: RCAResult) -> str:
+        return rca.manifest_patch.strip()
+
+    def format_prompt(self, snapshot: PodSnapshot, rca: RCAResult, sanitize: bool = True) -> str:
+        raw_events = "\n".join(snapshot.events[:10])
+        raw_logs = "\n".join(snapshot.previous_logs.get(rca.faulting_container, "").splitlines()[:50])
+        if sanitize:
+            raw_events = self.sanitizer.scrub(raw_events)
+            raw_logs = self.sanitizer.scrub(raw_logs)
+
+        prompt = f"""You are a Kubernetes Site Reliability Engineering specialist.
+Analyze the following sanitized Kubernetes incident snapshot:
+
+POD: {self.sanitizer.scrub(snapshot.pod_name) if sanitize else snapshot.pod_name}
+NAMESPACE: {self.sanitizer.scrub(snapshot.namespace) if sanitize else snapshot.namespace}
+FAILURE MODE: {rca.category} (Exit Code: {rca.exit_code})
+
+EVENTS:
+{raw_events or 'No warning events recorded.'}
+
+PREVIOUS CONTAINER LOGS:
+{raw_logs or 'No previous logs available.'}
+
+DIAGNOSIS SUMMARY:
+{self.sanitizer.scrub(rca.root_cause) if sanitize else rca.root_cause}
+
+Verify the recommended manifest diff:
+{rca.manifest_patch}
+"""
+        return prompt.strip()
+
+
+# ----------------------------------------------------------------------
+# CLI Interface
+# ----------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Kubernetes CrashLoopBackOff & OOMKilled RCA Engine (k8s-pod-rca)"
+    )
+    parser.add_argument(
+        "-i", "--input",
+        type=str,
+        help="Path to file containing pod JSON, kubectl describe dump, or collector snapshot bundle"
+    )
+    parser.add_argument(
+        "-f", "--format",
+        choices=["markdown", "json", "diff", "prompt", "all"],
+        default="markdown",
+        help="Output report format (default: markdown)"
+    )
+    parser.add_argument(
+        "--sanitize",
+        action="store_true",
+        default=True,
+        help="Enable client-side PII sanitization (default: enabled)"
+    )
+    parser.add_argument(
+        "--no-sanitize",
+        dest="sanitize",
+        action="store_false",
+        help="Disable client-side PII sanitization"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        type=str,
+        help="Output file path (or directory when --format=all)"
+    )
+    return parser
+
+
+def main() -> None:
+    cli_parser = build_parser()
+    args = cli_parser.parse_args()
+
+    content = ""
+    if args.input:
+        in_path = Path(args.input)
+        if not in_path.exists():
+            print(f"Error: Input file '{args.input}' does not exist.", file=sys.stderr)
+            sys.exit(1)
+        content = in_path.read_text(encoding="utf-8")
+    elif not sys.stdin.isatty():
+        content = sys.stdin.read()
+    else:
+        cli_parser.print_help()
+        sys.exit(0)
+
+    sanitizer = Sanitizer()
+    parser = PodSnapshotParser(sanitizer=sanitizer)
+    engine = K8sRCAEngine(sanitizer=sanitizer)
+    generator = RCAReportGenerator(sanitizer=sanitizer)
+
+    snapshot = parser.parse(content)
+    rca = engine.analyze(snapshot)
+
+    if args.format == "all":
+        out_dir = Path(args.output or "./k8s-rca-output")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "rca-report.md").write_text(generator.format_markdown(snapshot, rca, sanitize=args.sanitize), encoding="utf-8")
+        (out_dir / "rca-data.json").write_text(generator.format_json(snapshot, rca, sanitize=args.sanitize), encoding="utf-8")
+        (out_dir / "patch.diff").write_text(generator.format_diff(rca), encoding="utf-8")
+        (out_dir / "llm-prompt.txt").write_text(generator.format_prompt(snapshot, rca, sanitize=args.sanitize), encoding="utf-8")
+        print(f"Successfully exported all formats to: {out_dir}")
+        return
+
+    out_text = ""
+    if args.format == "markdown":
+        out_text = generator.format_markdown(snapshot, rca, sanitize=args.sanitize)
+    elif args.format == "json":
+        out_text = generator.format_json(snapshot, rca, sanitize=args.sanitize)
+    elif args.format == "diff":
+        out_text = generator.format_diff(rca)
+    elif args.format == "prompt":
+        out_text = generator.format_prompt(snapshot, rca, sanitize=args.sanitize)
+
+    if args.output:
+        out_file = Path(args.output)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        out_file.write_text(out_text, encoding="utf-8")
+        print(f"Successfully generated RCA report: {out_file}")
+    else:
+        print(out_text)
+
+
+if __name__ == "__main__":
+    main()

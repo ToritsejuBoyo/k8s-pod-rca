@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+report.json
+report.html
+triage-snapshot.json
+k8s-pod-snapshot.json

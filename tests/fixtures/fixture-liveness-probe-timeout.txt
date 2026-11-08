@@ -1,0 +1,47 @@
+Name:             synthetic-billing-worker-58bf9c-m8p1
+Namespace:        synthetic-workloads
+Priority:         0
+Node:             node-02.internal/192.0.2.11
+Start Time:       Wed, 04 Nov 2026 11:20:00 +0000
+Labels:           app=billing-worker
+Status:           Running
+IP:               192.0.2.62
+Containers:
+  billing-worker:
+    Container ID:   containerd://0000000000000000000000000000000000000000000000000000000000000002
+    Image:          registry.example.local/synthetic-workloads/billing-worker:v1.9.0
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       Error
+      Exit Code:    143
+      Started:      Wed, 04 Nov 2026 11:25:00 +0000
+      Finished:     Wed, 04 Nov 2026 11:25:45 +0000
+    Ready:          False
+    Restart Count:  4
+    Limits:
+      cpu:     500m
+      memory:  1Gi
+    Requests:
+      cpu:     250m
+      memory:  512Mi
+    Liveness:   http-get http://:8080/healthz delay=10s timeout=1s period=10s #success=1 #failure=3
+    Readiness:  http-get http://:8080/ready delay=5s timeout=1s period=10s #success=1 #failure=3
+
+Events:
+  Type     Reason     Age                From               Message
+  ----     ------     ----               ----               -------
+  Normal   Scheduled  15m                default-scheduler  Successfully assigned synthetic-workloads/synthetic-billing-worker-58bf9c-m8p1 to node-02.internal
+  Normal   Pulled     14m                kubelet            Container image already present on machine
+  Normal   Created    14m                kubelet            Created container billing-worker
+  Normal   Started    14m                kubelet            Started container billing-worker
+  Warning  Unhealthy  12m (x3 over 13m)  kubelet            Liveness probe failed: Get "http://192.0.2.62:8080/healthz": context deadline exceeded
+  Normal   Killing    12m                kubelet            Container billing-worker failed liveness probe, will be restarted
+
+--- PREVIOUS LOG: billing-worker ---
+2026-11-04 11:25:01.102  INFO 1 --- [main] c.s.b.BillingApplication : Starting BillingApplication v1.9.0 using Java 21 on synthetic-billing-worker-58bf9c-m8p1
+2026-11-04 11:25:05.410  INFO 1 --- [main] o.s.b.w.embedded.tomcat.TomcatWebServer  : Tomcat initialized with port 8080 (http)
+2026-11-04 11:25:20.890  INFO 1 --- [main] o.f.c.i.database.base.DatabaseType       : Database: PostgreSQL 16.1
+2026-11-04 11:25:25.100  INFO 1 --- [main] o.f.core.internal.command.DbMigrate      : Executing Flyway schema migration scripts across 14 tables...
+2026-11-04 11:25:44.200  WARN 1 --- [http-nio-8080-exec-1] c.s.b.w.HealthEndpoint : Healthz check received before schema migrations completed. Response took 1.25s.
+2026-11-04 11:25:45.000  INFO 1 --- [Thread-5] c.s.b.BillingApplication : Received SIGTERM from kubelet. Initiating graceful shutdown.

@@ -1,0 +1,72 @@
+{
+  "collected_at": "2026-11-04T10:15:30Z",
+  "namespace": "synthetic-workloads",
+  "pod_name": "synthetic-checkout-api-7d9c8b-x2k4",
+  "pod_spec_and_status": {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "metadata": {
+      "name": "synthetic-checkout-api-7d9c8b-x2k4",
+      "namespace": "synthetic-workloads",
+      "labels": {
+        "app": "checkout-api",
+        "tier": "backend"
+      }
+    },
+    "spec": {
+      "nodeName": "node-01.internal",
+      "containers": [
+        {
+          "name": "checkout-api",
+          "image": "registry.example.local/synthetic-workloads/checkout-api:v2.4.1",
+          "resources": {
+            "requests": {
+              "cpu": "250m",
+              "memory": "256Mi"
+            },
+            "limits": {
+              "cpu": "1000m",
+              "memory": "512Mi"
+            }
+          }
+        }
+      ]
+    },
+    "status": {
+      "phase": "Running",
+      "qosClass": "Burstable",
+      "hostIP": "192.0.2.10",
+      "podIP": "192.0.2.55",
+      "containerStatuses": [
+        {
+          "name": "checkout-api",
+          "ready": false,
+          "restartCount": 5,
+          "state": {
+            "waiting": {
+              "reason": "CrashLoopBackOff",
+              "message": "back-off 5m0s restarting failed container=checkout-api pod=synthetic-checkout-api-7d9c8b-x2k4"
+            }
+          },
+          "lastState": {
+            "terminated": {
+              "exitCode": 137,
+              "reason": "OOMKilled",
+              "startedAt": "2026-11-04T10:10:00Z",
+              "finishedAt": "2026-11-04T10:14:22Z",
+              "containerID": "containerd://0000000000000000000000000000000000000000000000000000000000000001"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "events": [
+    "Warning OOMKilled: Task in /kubepods/burstable/pod-01/checkout-api was killed by oom-killer (score 950, limit 536870912 bytes)",
+    "Warning BackOff: Back-off restarting failed container checkout-api in pod synthetic-checkout-api-7d9c8b-x2k4"
+  ],
+  "previous_logs": {
+    "checkout-api": "2026-11-04T10:10:05Z [INFO] Initializing checkout microservice v2.4.1\n2026-11-04T10:10:12Z [INFO] Connected to cache at redis.synthetic-workloads.svc.cluster.local:6379\n2026-11-04T10:14:15Z [WARN] In-memory shopping cart cache grew past 420MB across 12,000 active sessions\n2026-11-04T10:14:21Z [FATAL] JavaScript heap out of memory or Linux cgroup memory limit exceeded (Allocated: 511.8MB, Limit: 512.0MB)"
+  },
+  "current_logs": {}
+}

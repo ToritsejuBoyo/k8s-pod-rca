@@ -1,0 +1,64 @@
+{
+  "collected_at": "2026-11-04T14:30:00Z",
+  "namespace": "synthetic-workloads",
+  "pod_name": "synthetic-ml-inference-88c9f-v4b2",
+  "pod_spec_and_status": {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "metadata": {
+      "name": "synthetic-ml-inference-88c9f-v4b2",
+      "namespace": "synthetic-workloads"
+    },
+    "spec": {
+      "nodeName": "node-01.internal",
+      "containers": [
+        {
+          "name": "inference-engine",
+          "image": "registry.example.local/synthetic-workloads/ml-inference:v2.1.0-native",
+          "resources": {
+            "requests": {
+              "cpu": "1000m",
+              "memory": "2Gi"
+            },
+            "limits": {
+              "cpu": "2000m",
+              "memory": "4Gi"
+            }
+          }
+        }
+      ]
+    },
+    "status": {
+      "phase": "Running",
+      "qosClass": "Burstable",
+      "containerStatuses": [
+        {
+          "name": "inference-engine",
+          "ready": false,
+          "restartCount": 3,
+          "state": {
+            "waiting": {
+              "reason": "CrashLoopBackOff"
+            }
+          },
+          "lastState": {
+            "terminated": {
+              "exitCode": 139,
+              "reason": "Error",
+              "signal": 11,
+              "startedAt": "2026-11-04T14:25:00Z",
+              "finishedAt": "2026-11-04T14:25:12Z"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "events": [
+    "Warning BackOff: Back-off restarting failed container inference-engine in pod synthetic-ml-inference-88c9f-v4b2"
+  ],
+  "previous_logs": {
+    "inference-engine": "2026-11-04T14:25:02Z [INFO] Initializing TensorRT inference runtime on device\n2026-11-04T14:25:05Z [INFO] Loading dynamic library /opt/lib/libtensor_accel.so\n2026-11-04T14:25:11Z [DEBUG] Allocating GPU shared buffer pool\n2026-11-04T14:25:12Z [FATAL] Segmentation fault (core dumped): Invalid memory reference at address 0x0000000000000018\nSegmentation fault"
+  },
+  "current_logs": {}
+}
