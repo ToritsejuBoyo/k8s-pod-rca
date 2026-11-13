@@ -1,11 +1,13 @@
 # Kubernetes CrashLoopBackOff & OOMKilled RCA (`k8s-pod-rca`)
 
-[![Standard: Kubernetes v1.24+](https://img.shields.io/badge/Kubernetes-v1.24%20--%20v1.32%2B-blue.svg)](https://kubernetes.io/)
+
+[![tests](https://github.com/ToritsejuBoyo/k8s-pod-rca/actions/workflows/tests.yml/badge.svg)](https://github.com/ToritsejuBoyo/k8s-pod-rca/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)]()
+[![Dependencies](https://img.shields.io/badge/dependencies-zero%20(stdlib%20only)-brightgreen.svg)](CONTRIBUTING.md)
+[![Security](https://img.shields.io/badge/security-read--only%20%7C%20no%20egress-informational.svg)](SECURITY.md)
+[![Standard](https://img.shields.io/badge/standard-agentskills.io-blueviolet.svg)](https://agentskills.io)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(Stdlib)-brightgreen.svg)]()
-[![Platform: Cross-Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
-[![Enterprise Compliance: SOC2 / ISO 27001](https://img.shields.io/badge/Compliance-Zero%20Telemetry%20Leakage-success.svg)]()
-[![Security: Read-Only Audit](https://img.shields.io/badge/Security-Strictly%20Read--Only-informational.svg)]()
 
 > Deterministic root-cause analysis engine and read-only diagnostic collector for Kubernetes pods failing with `CrashLoopBackOff`, `OOMKilled` (Exit Code 137), `ImagePullBackOff`, `CreateContainerConfigError`, `Init:CrashLoopBackOff`, or probe misconfigurations. Generates sanitized executive SRE RCA incident reports, declarative YAML manifest patches (`diff -u`), and verification runbooks without cluster mutation.
 

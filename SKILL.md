@@ -1,7 +1,18 @@
 ---
 name: k8s-pod-rca
-description: >
-  Performs deterministic root-cause analysis (RCA) for Kubernetes pods stuck in CrashLoopBackOff, OOMKilled, ImagePullBackOff, CreateContainerConfigError, Init:CrashLoopBackOff, or Pending/Evicted states. Use this skill when a DevOps Engineer, SRE, Platform Engineer, or Cloud Support Engineer needs to correlate pod status JSON, previous container logs, liveness/readiness/startup probe timing mismatches, cgroup memory/CPU limits, and namespace warning events into an exact root cause and a production-ready Kubernetes YAML manifest diff.
+description: >-
+  Performs deterministic root-cause analysis (RCA) for Kubernetes pods stuck in CrashLoopBackOff,
+  OOMKilled, ImagePullBackOff, CreateContainerConfigError, Init:CrashLoopBackOff, or
+  Pending/Evicted states. Use this skill when a DevOps Engineer, SRE, Platform Engineer, or Cloud
+  Support Engineer needs to correlate pod status JSON, previous container logs,
+  liveness/readiness/startup probe timing mismatches, cgroup memory/CPU limits, and namespace
+  warning events into an exact root cause and a production-ready Kubernetes YAML manifest diff.
+license: MIT
+version: 1.0.0
+metadata:
+  standard: agentskills.io
+  dependencies: none (Python standard library only)
+  access: read-only collectors; no state is modified on target systems
 ---
 
 # Kubernetes CrashLoopBackOff & OOMKilled RCA Skill (`k8s-pod-rca`)
@@ -41,6 +52,20 @@ bash ./scripts/collect-k8s-pod-triage.sh \
   --output ./k8s-pod-snapshot.json
 ```
 
+On Windows hosts (PowerShell 5.1 / 7+), use the equivalent collector:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\collect-k8s-pod-triage.ps1 `
+  -PodName payments-api-7d9c8b6f4-x9k2m `
+  -Namespace production `
+  -LogLines 150 `
+  -OutputPath .\k8s-pod-snapshot.json
+```
+
+Note: the PowerShell collector has no `-Sanitize` switch. When using it, run the
+analysis engine with its default sanitization enabled (Step 0) so masking still occurs
+before any data leaves the host.
+
 Upload or paste the generated `k8s-pod-snapshot.json` into the chat.
 
 ### Mode B: Manual `kubectl` Output Paste
@@ -52,6 +77,34 @@ If you cannot run the collector script, paste the output of the following three 
 ---
 
 ## Multi-Step Diagnostic & Execution Workflow
+
+### Step 0: Run the Deterministic RCA Engine (Required First Step)
+Always run the bundled analysis engine before reasoning manually. It implements the
+full exit-code, probe-geometry, and cgroup correlation logic deterministically, so the
+verdict is reproducible rather than inferred:
+
+```bash
+# Markdown RCA report (default)
+python scripts/k8s_pod_rca.py -i ./k8s-pod-snapshot.json -f markdown
+
+# Structured JSON for programmatic inspection
+python scripts/k8s_pod_rca.py -i ./k8s-pod-snapshot.json -f json
+
+# Ready-to-apply manifest patch only
+python scripts/k8s_pod_rca.py -i ./k8s-pod-snapshot.json -f diff
+
+# Every artifact at once into a directory
+python scripts/k8s_pod_rca.py -i ./k8s-pod-snapshot.json -f all -o ./rca-out/
+```
+
+The engine accepts a collector bundle, raw `kubectl get pod -o json`, or a
+`kubectl describe` text dump via `-i`, or on stdin when `-i` is omitted.
+Client-side sanitization is **on by default**; pass `--no-sanitize` only when the
+operator explicitly asks for unmasked output.
+
+Use Steps 1-3 below to interpret and sanity-check the engine's findings. If the
+engine reports `Diagnostic Confidence: Low`, fall back to manual analysis and say so
+explicitly in the report.
 
 ### Step 1: Classify the Pod Phase & Container State Machine
 Inspect `status.phase`, `status.conditions`, `status.initContainerStatuses`, and `status.containerStatuses`:
@@ -90,6 +143,34 @@ When the user requests `--generate-proof-of-work` or a portfolio artifact:
 
 ## Bundled Resources
 
+- **RCA Engine:** [`scripts/k8s_pod_rca.py`](scripts/k8s_pod_rca.py) — Deterministic analysis engine (stdlib only). Classifies pod phase, maps exit codes/signals, correlates probe geometry against cgroup limits, and emits markdown, JSON, manifest diff, prompt, HTML, or proof-of-work output. **Run this first (Step 0).**
+- **Collector Script (PowerShell):** [`scripts/collect-k8s-pod-triage.ps1`](scripts/collect-k8s-pod-triage.ps1) — Read-only Windows collector producing the same snapshot bundle as the Bash collector.
 - **Collector Script:** [`scripts/collect-k8s-pod-triage.sh`](scripts/collect-k8s-pod-triage.sh) — Read-only Bash collector using `kubectl` to gather sanitized pod YAML/JSON, current and `--previous` container logs, namespace events, and resource metrics into a single JSON file.
 - **Technical Reference:** [`references/k8s-exit-codes-and-probes.md`](references/k8s-exit-codes-and-probes.md) — Deep reference covering Linux signal math (`128 + N`), `OOMKilled` vs. Probe `137` disambiguation, JVM/Node/Python container memory sizing formulas, and probe anti-patterns.
 - **Report Template:** [`assets/k8s-pod-rca-template.md`](assets/k8s-pod-rca-template.md) — Structured SRE Root Cause Analysis report with YAML manifest diff and Proof-of-Work summary.
+
+---
+
+## Data Handling & Sanitization
+
+Sanitization runs **client-side, before any output is produced**, so credentials and
+personal data are removed on the operator's machine rather than being sent to a model
+or pasted into a ticket.
+
+Two layers apply:
+
+1. This skill's own domain-aware masking (hostnames, accounts, and the identifiers
+   specific to this domain).
+2. A shared residual pass, [`scripts/sanitizer.py`](scripts/sanitizer.py), vendored
+   identically across every skill in the library. It is the common floor: private keys,
+   cloud provider keys, JWTs and bearer tokens, connection-string passwords, assigned
+   secrets, emails, IPv4/IPv6 addresses, MAC addresses, GUIDs, SSNs, payment card
+   numbers, and phone numbers.
+
+The contract is enforced by `tests/sanitizer_conformance_test.py`, which runs the same
+adversarial corpus in every skill. Documentation placeholders (RFC 5737/3849 addresses,
+RFC 7042 MAC ranges, `example.com` names, and existing `[REDACTED-*]` tokens) are
+preserved, so the pass is safe to apply more than once.
+
+Sanitization is thorough and tested, but it is not a substitute for reading output
+before sharing it outside your organization.
