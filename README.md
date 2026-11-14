@@ -3,7 +3,7 @@
 
 [![tests](https://github.com/ToritsejuBoyo/k8s-pod-rca/actions/workflows/tests.yml/badge.svg)](https://github.com/ToritsejuBoyo/k8s-pod-rca/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)]()
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)]()
 [![Dependencies](https://img.shields.io/badge/dependencies-zero%20(stdlib%20only)-brightgreen.svg)](CONTRIBUTING.md)
 [![Security](https://img.shields.io/badge/security-read--only%20%7C%20no%20egress-informational.svg)](SECURITY.md)
 [![Standard](https://img.shields.io/badge/standard-agentskills.io-blueviolet.svg)](https://agentskills.io)
@@ -39,7 +39,7 @@ When containerized microservices crash in production Kubernetes clusters, platfo
 ### 4. Why IT Leadership Approves
 - **Strictly Read-Only (Zero Mutation Risk):** Neither the collector nor the diagnostic engine executes mutating commands (`apply`, `delete`, `patch`, `scale`, `exec`). Cluster state remains untouched.
 - **Automated Client-Side Data Sanitization:** Scrubs RFC 1918 private IPs, container registry domains, namespace identifiers, and base64/environment secrets before telemetry leaves the local machine.
-- **Zero Third-Party Dependencies:** Implemented strictly with the Python standard library (Python 3.9+) and native shell/PowerShell. Requires no package installations, no external network access, and no daemon processes.
+- **Zero Third-Party Dependencies:** Implemented strictly with the Python standard library (Python 3.10+) and native shell/PowerShell. Requires no package installations, no external network access, and no daemon processes.
 - **Infrastructure Cost Optimization:** Differentiates genuine memory leaks from startup probe delays, preventing needless resource request inflation and wasteful cloud cluster over-provisioning.
 
 ---

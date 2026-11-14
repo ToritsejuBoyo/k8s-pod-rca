@@ -840,9 +840,15 @@ class K8sRCAEngine:
                 break
 
         result.root_cause = f"Container '{cs.name}' declares an environment variable or volume mount referencing '{missing_res}', which does not exist in namespace '{snapshot.namespace}'."
+        # Built in two steps rather than as a nested f-string with escaped quotes.
+        # That construct only parses on Python 3.12+ (PEP 701); on 3.9-3.11 it is a
+        # hard SyntaxError, so this module would not import at all for most users
+        # despite the documented 3.9+ support.
+        _fallback_msg = 'secret "%s" not found' % missing_res
+        _event_msg = self._extract_matching_event(snapshot.events, "not found") or _fallback_msg
         result.evidence = [
             f"Container State: {cs.state_reason or 'CreateContainerConfigError'}",
-            f"Event Message: {self._extract_matching_event(snapshot.events, 'not found') or f'secret \"{missing_res}\" not found'}"
+            f"Event Message: {_event_msg}",
         ]
 
         result.timeline = [
